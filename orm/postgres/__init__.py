@@ -3,8 +3,11 @@ from .. import CollectionProtocol, ConnectionProtocol, PoolProtocol
 from ..attributed_dict import AttributedDict
 from ..typemap import typemap as tm
 from ..order import OrderType
-from typing import Coroutine, Optional
+from ..models import (Model, Field, BoolField, IntegerField, DecimalField, FloatField, TextField, TimeField, TimeDeltaField, 
+                      BinaryField, UIDField, UUIDField)
+from typing import Coroutine, Optional, Final
 from functools import partial
+from datetime import datetime, timedelta
 import asyncpg
 
 
@@ -92,15 +95,47 @@ class PostgresCollection(CollectionProtocol):
             {'WHERE ' if _filter else ''}{' AND '.join([f'{list(_filter.keys())[i]}=${i+1}' for i in range(0, len(_filter))])};''',
             *_filter.values()))[0]['count']
     async def get_size(self) -> int: ...
-    async def drop(self) -> None: ...
+    
+    async def drop(self, *, not_exists_ok: bool = False) -> None: 
+        await self.connection._fetch(f'DROP TABLE {'IF EXISTS ' if not_exists_ok else ''}{self.name};')
 
 
 class PostgresConnection(ConnectionProtocol):
+    FIELDS_MAP: Final[dict] = {
+        BoolField: lambda field: 'BOOLEAN',
+        IntegerField: lambda field: {
+            2: 'SMALLINT',
+            4: 'INTEGER',
+            8: 'BIGINT'
+        }[field.size],
+        DecimalField: lambda field: 'DECIMAL',
+        FloatField: lambda field: 'DOUBLE PRECISION' if field.double else 'REAL',
+        TextField: lambda field: 'TEXT',
+        TimeField: lambda field: {
+            (False, False, True): 'TIME',
+            (False, True, False): 'DATE',
+            (False, True, True): 'TIMESTAMP',
+            (True, False, True): 'TIMETZ',
+            (True, True, False): 'DATE',
+            (True, True, True): 'TIMESTAMPTZ'
+        }[field.zone, field.date, field.time] + (
+            '' if field.default is None else (' DEFAULT ' + {
+                datetime: lambda dt: f'to_timestamp({dt.timestamp()})',
+                timedelta: lambda td: f'NOW() + INTERVAL \'{td.total_seconds()} seconds\''
+            }[type(field.default)](field.default))
+        ),
+        TimeDeltaField: lambda field: 'INTERVAL',
+        BinaryField: lambda field: 'BYTEA',
+        UIDField: lambda field: 'BIGINT',
+        UUIDField: lambda field: 'UUID'
+    }
+
     def __init__(self, pool, connection, transaction, autocommit=True):
         self._pool = pool
         self._connection = connection
         self._transaction = transaction
         self._autocommit = autocommit
+        self.collection = self.__getattr__
     
     def __getattr__(self, key) -> CollectionProtocol:
         return PostgresCollection(self, key)
@@ -117,6 +152,46 @@ class PostgresConnection(ConnectionProtocol):
             FROM information_schema.tables
             WHERE table_schema NOT IN ('pg_catalog', 'information_schema') AND table_type = 'BASE TABLE'
             ORDER BY table_name;''')]
+
+    async def create(self, model: Model, *, exists_ok=False) -> None:
+        model._update_meta(model)
+        fields = []
+        for field_name in model.__dict__.keys():
+            field = getattr(model, field_name)
+            if field_name.startswith('_') or not isinstance(field, Field):
+                continue
+            fields.append(
+                f'''
+                    {field_name} {self.FIELDS_MAP[type(field)](field)}
+                    {'UNIQUE' if hasattr(field, 'unique') and field.unique else ''}
+                    {'NOT NULL' if hasattr(field, 'not_null') and field.not_null else ''}
+                    {'GENERATED ALWAYS AS IDENTITY' if hasattr(field, 'identity') and field.identity else ''}
+                    {f'REFERENCES {field.reference.collection_name}({field.reference.field_name})' 
+                     if hasattr(field, 'reference') and field.reference else ''}
+                '''.strip()
+            )
+        await self._fetch(f'''
+            CREATE TABLE {'IF NOT EXISTS ' if exists_ok else ''}{model.__collection_name__()}(
+                {','.join(fields)},
+                {f'PRIMARY KEY ({','.join(model._meta_primary_keys)})' if model._meta_primary_keys else ''}
+            );
+        '''.strip())
+    
+    async def create_index(
+        self,
+        index_name: str,
+        collection_name: str,
+        fields: tuple[str],
+        *,
+        exists_ok: bool=False,
+        unique: bool=False
+    ) -> None:
+        print(f"""
+            CREATE {'UNIQUE ' if unique else ''}INDEX {'IF NOT EXISTS ' if exists_ok else ''}{index_name} ON {collection_name}({','.join(fields)});
+        """)
+        await self._fetch(f'''
+            CREATE {'UNIQUE ' if unique else ''}INDEX {'IF NOT EXISTS ' if exists_ok else ''}{index_name} ON {collection_name}({','.join(fields)});
+        ''')
     
     async def __aenter__(self):
         await self._transaction.start()
@@ -145,14 +220,11 @@ class PostgresPool(PoolProtocol):
         self._pool_factory = pool_factory
         self._autocommit = autocommit
         self._pool = None
-        self._tasks = []
-    
-    async def connect(self):
-        self._pool = await self._pool_factory()
+        self._tasks = []    
     
     async def acquire(self) -> PostgresConnection:
         if not self._pool:
-            await self.connect()
+            self._pool = await self._pool_factory()
         connection = await self._pool.acquire()
         transaction = connection.transaction()
         pg_conn = PostgresConnection(self, connection, transaction)
@@ -176,6 +248,7 @@ def Postgres(
         dsn: Optional[str] = None,
         *,
         host: Optional[str] = None,
+        port: Optional[int] = None,
         user: Optional[str] = None,
         password: Optional[str] = None,
         database: Optional[str] = None,
@@ -185,7 +258,11 @@ def Postgres(
         partial(
             asyncpg.create_pool,
             dsn,
+            server_settings=server_settings
+        ) if dsn else partial(
+            asyncpg.create_pool,
             host=host,
+            port=port,
             user=user,
             password=password,
             database=database,

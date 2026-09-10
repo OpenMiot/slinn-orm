@@ -1,15 +1,15 @@
 from __future__ import annotations
-
-import asyncio
 from functools import partial
-from typing import Any, Coroutine, Optional
-
-import aiosqlite
-
+from typing import Any, Coroutine, Optional, Final
 from .. import CollectionProtocol, ConnectionProtocol, PoolProtocol
 from ..attributed_dict import AttributedDict
-from ..order import OrderType
 from ..typemap import typemap as tm
+from ..order import OrderType
+from ..models import (Model, Field, BoolField, IntegerField, DecimalField, FloatField, TextField, TimeField, TimeDeltaField, 
+                      BinaryField, UIDField, UUIDField)
+from datetime import datetime, timedelta
+import aiosqlite
+import asyncio
 
 
 class SQLiteCollection(CollectionProtocol):
@@ -137,20 +137,46 @@ class SQLiteCollection(CollectionProtocol):
         return rows[0][0] if rows else 0
 
     async def get_size(self) -> int:
-        # SQLite does not have a direct table size function,
-        # but we can approximate with COUNT(*).
-        return await self.count({})
+        rows = await self.connection._fetch(
+            f'''
+                SELECT COUNT(*) * pgsize AS table_size_bytes
+                FROM sqlite_dbpage, (SELECT page_size AS pgsize FROM pragma_page_size())
+                WHERE schema = 'main' AND pgno IN (
+                    SELECT rootpage FROM sqlite_schema WHERE tbl_name = '{self.name}'
+                );
+            '''
+        )
+        return rows[0] if rows else 0
 
-    async def drop(self) -> None:
-        await self.connection._execute(f"DROP TABLE IF EXISTS {self.name}")
+    async def drop(self, *, not_exists_ok: bool = False) -> None: 
+        await self.connection._fetch(f'DROP TABLE {'IF EXISTS ' if not_exists_ok else ''}{self.name};')
 
 
 class SQLiteConnection(ConnectionProtocol):
+    FIELDS_MAP: Final[dict] = {
+        BoolField: lambda field: 'INTEGER',
+        IntegerField: lambda field: 'INTEGER',
+        DecimalField: lambda field: 'DECIMAL',
+        FloatField: lambda field: 'REAL',
+        TextField: lambda field: 'TEXT',
+        TimeField: lambda field: 'INTEGER' + (
+            '' if field.default is None else (' DEFAULT ' + {
+                datetime: lambda dt: f'{dt.timestamp()}',
+                timedelta: lambda td: f'(unixepoch() + {td.total_seconds()})'
+            }[type(field.default)](field.default))
+        ),
+        TimeDeltaField: lambda field: 'INTEGER',
+        BinaryField: lambda field: 'BLOB',
+        UIDField: lambda field: 'INTEGER',
+        UUIDField: lambda field: 'TEXT'
+    }
+
     def __init__(self, pool: SQLitePool, connection: aiosqlite.Connection, autocommit: bool = True):
         self._pool = pool
         self._connection = connection
         self._autocommit = autocommit
         self._in_transaction = False
+        self.collection = self.__getattr__
 
     def __getattr__(self, key) -> CollectionProtocol:
         return SQLiteCollection(self, key)
@@ -169,8 +195,48 @@ class SQLiteConnection(ConnectionProtocol):
         )
         return [row[0] for row in rows]
 
+    async def create(self, model: Model, *, exists_ok=False) -> None:
+        model._update_meta(model)
+        fields = []
+        for field_name in model.__dict__.keys():
+            field = getattr(model, field_name)
+            if field_name.startswith('_') or not isinstance(field, Field):
+                continue
+            fields.append(
+                f'''
+                    {field_name} {self.FIELDS_MAP[type(field)](field)}
+                    {'PRIMARY KEY' if len(model._meta_primary_keys) == 1 and field_name in model._meta_primary_keys else ''}
+                    {'AUTOINCREMENT' if hasattr(field, 'identity') and field.identity else ''}
+                    {'UNIQUE' if hasattr(field, 'unique') and field.unique else ''}
+                    {'NOT NULL' if (hasattr(field, 'not_null') and field.not_null) or field_name not in model._meta_primary_keys else ''}
+                    {f'REFERENCES {field.reference.collection_name}({field.reference.field_name})' 
+                     if hasattr(field, 'reference') and field.reference else ''}
+                '''.strip()
+            )
+        await self._fetch(f'''
+            CREATE TABLE {'IF NOT EXISTS ' if exists_ok else ''}{model.__collection_name__()}(
+                {','.join(fields)}
+                {f',PRIMARY KEY ({','.join(model._meta_primary_keys)})' if len(model._meta_primary_keys) > 1 else ''}
+            );
+        '''.strip())
+    
+    async def create_index(
+        self,
+        index_name: str,
+        collection_name: str,
+        fields: tuple[str],
+        *,
+        exists_ok: bool=False,
+        unique: bool=False
+    ) -> None:
+        print(f"""
+            CREATE {'UNIQUE ' if unique else ''}INDEX {'IF NOT EXISTS ' if exists_ok else ''}{index_name} ON {collection_name}({','.join(fields)});
+        """)
+        await self._fetch(f'''
+            CREATE {'UNIQUE ' if unique else ''}INDEX {'IF NOT EXISTS ' if exists_ok else ''}{index_name} ON {collection_name}({','.join(fields)});
+        ''')
+
     async def __aenter__(self):
-        # Begin a transaction
         await self._connection.execute("BEGIN")
         self._in_transaction = True
         return self
@@ -185,10 +251,10 @@ class SQLiteConnection(ConnectionProtocol):
             await self._pool.release(self)
 
     async def _fetch(self, query: str, *args, timeout: Optional[float] = None) -> list:
-        # timeout is ignored for sqlite (could be implemented with asyncio.wait_for)
-        query = " ".join(line.strip() for line in query.split("\n")).strip()
-        async with self._connection.execute(query, args) as cursor:
-            return await cursor.fetchall()
+        async with asyncio.timeout(timeout):
+            query = " ".join(line.strip() for line in query.split("\n")).strip()
+            async with self._connection.execute(query, args) as cursor:
+                return await cursor.fetchall()
 
     async def _execute(self, query: str, *args) -> None:
         query = " ".join(line.strip() for line in query.split("\n")).strip()
@@ -204,10 +270,6 @@ class SQLitePool(PoolProtocol):
         self._lock = asyncio.Lock()
         self._tasks: list[Coroutine[Any, Any, Any]] = []
         self._closed = False
-
-    async def connect(self) -> None:
-        # Nothing to do; connections are created on acquire
-        pass
     
     async def acquire(self) -> SQLiteConnection:
         async with self._lock:

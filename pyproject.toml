@@ -3,16 +3,16 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fobox-orm"
-version = "0.0.2"
-description = "ORM for Fobox"
+name = "slinn-orm"
+version = "0.0.3"
+description = "ORM for Slinn"
 requires-python = ">=3.14"
 authors = [{ name = "Mark Radin", email = "openmiot@gmail.com" }]
 
 [project.optional-dependencies]
 postgres = ["asyncpg"]
 sqlite = ["aiosqlite"]
-full = ["fobox-orm[postgres]", "fobox-orm[sqlite]"]
+full = ["slinn-orm[postgres]", "slinn-orm[sqlite]"]
 
 [tool.setuptools.packages.find]
 where = ["."]
