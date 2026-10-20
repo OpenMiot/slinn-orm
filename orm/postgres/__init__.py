@@ -3,8 +3,10 @@ from .. import CollectionProtocol, ConnectionProtocol, PoolProtocol
 from ..attributed_dict import AttributedDict
 from ..typemap import typemap as tm
 from ..order import OrderType
-from ..models import (Model, Field, BoolField, IntegerField, DecimalField, FloatField, TextField, TimeField, TimeDeltaField, 
-                      BinaryField, UIDField, UUIDField)
+from ..models import (
+    Model, Field, BoolField, IntegerField, DecimalField, FloatField, TextField, TimeField, TimeDeltaField, 
+    BinaryField, UIDField, UUIDField, InetField
+)
 from typing import Coroutine, Optional, Final
 from functools import partial
 from datetime import datetime, timedelta
@@ -12,9 +14,10 @@ import asyncpg
 
 
 class PostgresCollection(CollectionProtocol):
-    def __init__(self, connection: PostgresConnection, name: str):
+    def __init__(self, connection: PostgresConnection, name: str, model: Model | None = None):
         self.connection = connection
         self.name = name
+        self.model = model
 
     async def find(
         self,
@@ -22,7 +25,7 @@ class PostgresCollection(CollectionProtocol):
         *,
         fields: tuple[str] = ('*',),
         order: tuple[tuple[OrderType, str]] = ()) -> list[dict]:
-        return [AttributedDict(record) for record in await self.connection._fetch(
+        return [self.model.__deserialize_object__(record) for record in await self.connection._fetch(
             f'SELECT {', '.join(fields)} '
             f'FROM {self.name} '
             f'{'WHERE ' if _filter else ''}{' AND '.join([f'{list(_filter.keys())[i]}=${i+1}' for i in range(0, len(_filter))])} '
@@ -48,9 +51,11 @@ class PostgresCollection(CollectionProtocol):
         typemap: dict | None = None) -> None: 
         if not _object:
             return []
+        if self.model:
+            _object = self.model.__serialize_object__(_object)
         records = await self.connection._fetch(
             f'INSERT INTO {self.name}({', '.join(_object.keys())}) '
-            f'VALUES({', '.join([f'${i+1}' for i in range(0, len(_object))])}) '
+            f'VALUES({', '.join([f'${i+1}' for i in range(len(_object))])}) '
             f'{'RETURNING' if returning else ''} {', '.join(returning)}',
             *tm(_object, typemap).values())
         return records[0] if records else None
@@ -64,6 +69,8 @@ class PostgresCollection(CollectionProtocol):
         typemap: dict | None = None) -> None:
         if not _object:
             return []
+        if self.model:
+            _object = self.model.__serialize_object__(_object)
         return await self.connection._fetch(
             f'UPDATE {self.name} '
             f'SET {', '.join([f'{key}=${i+1}' for i, key in enumerate(_object)])} '
@@ -94,6 +101,7 @@ class PostgresCollection(CollectionProtocol):
             FROM {self.name}
             {'WHERE ' if _filter else ''}{' AND '.join([f'{list(_filter.keys())[i]}=${i+1}' for i in range(0, len(_filter))])};''',
             *_filter.values()))[0]['count']
+    
     async def get_size(self) -> int: ...
     
     async def drop(self, *, not_exists_ok: bool = False) -> None: 
@@ -127,18 +135,22 @@ class PostgresConnection(ConnectionProtocol):
         TimeDeltaField: lambda field: 'INTERVAL',
         BinaryField: lambda field: 'BYTEA',
         UIDField: lambda field: 'BIGINT',
-        UUIDField: lambda field: 'UUID'
+        UUIDField: lambda field: 'UUID',
+        InetField: lambda field: 'INET'
     }
 
-    def __init__(self, pool, connection, transaction, autocommit=True):
+    def __init__(self, pool, connection, transaction, autocommit: bool = True):
         self._pool = pool
         self._connection = connection
         self._transaction = transaction
         self._autocommit = autocommit
+        self._models = set()
         self.collection = self.__getattr__
     
     def __getattr__(self, key) -> CollectionProtocol:
-        return PostgresCollection(self, key)
+        return PostgresCollection(
+            self, key, model = next(iter(model for model in self._models if model.__collection_name__() == key))
+        )
     
     async def rollback(self) -> None:
         await self._transaction.rollback()
@@ -154,9 +166,9 @@ class PostgresConnection(ConnectionProtocol):
             ORDER BY table_name;''')]
 
     async def create(self, model: Model, *, exists_ok=False) -> None:
-        model._update_meta(model)
+        model._update_meta()
         fields = []
-        for field_name in model.__dict__.keys():
+        for field_name in model.__dict__:
             field = getattr(model, field_name)
             if field_name.startswith('_') or not isinstance(field, Field):
                 continue
@@ -167,7 +179,8 @@ class PostgresConnection(ConnectionProtocol):
                     {'NOT NULL' if hasattr(field, 'not_null') and field.not_null else ''}
                     {'GENERATED ALWAYS AS IDENTITY' if hasattr(field, 'identity') and field.identity else ''}
                     {f'REFERENCES {field.reference.collection_name}({field.reference.field_name})' 
-                     if hasattr(field, 'reference') and field.reference else ''}
+                    if hasattr(field, 'reference') and field.reference else ''}
+                    {f'DEFAULT {field.default_expr}' if hasattr(field, 'default_expr') else ''}
                 '''.strip()
             )
         await self._fetch(f'''
@@ -176,6 +189,7 @@ class PostgresConnection(ConnectionProtocol):
                 {f'PRIMARY KEY ({','.join(model._meta_primary_keys)})' if model._meta_primary_keys else ''}
             );
         '''.strip())
+        self._models.add(model)
     
     async def create_index(
         self,
@@ -186,9 +200,6 @@ class PostgresConnection(ConnectionProtocol):
         exists_ok: bool=False,
         unique: bool=False
     ) -> None:
-        print(f"""
-            CREATE {'UNIQUE ' if unique else ''}INDEX {'IF NOT EXISTS ' if exists_ok else ''}{index_name} ON {collection_name}({','.join(fields)});
-        """)
         await self._fetch(f'''
             CREATE {'UNIQUE ' if unique else ''}INDEX {'IF NOT EXISTS ' if exists_ok else ''}{index_name} ON {collection_name}({','.join(fields)});
         ''')

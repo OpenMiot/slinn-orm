@@ -5,17 +5,20 @@ from .. import CollectionProtocol, ConnectionProtocol, PoolProtocol
 from ..attributed_dict import AttributedDict
 from ..typemap import typemap as tm
 from ..order import OrderType
-from ..models import (Model, Field, BoolField, IntegerField, DecimalField, FloatField, TextField, TimeField, TimeDeltaField, 
-                      BinaryField, UIDField, UUIDField)
+from ..models import (
+    Model, Field, BoolField, IntegerField, DecimalField, FloatField, TextField, TimeField, TimeDeltaField, 
+    BinaryField, UIDField, UUIDField, InetField
+)
 from datetime import datetime, timedelta
 import aiosqlite
 import asyncio
 
 
 class SQLiteCollection(CollectionProtocol):
-    def __init__(self, connection: SQLiteConnection, name: str):
+    def __init__(self, connection: SQLiteConnection, name: str, model: Model | None = None):
         self.connection = connection
         self.name = name
+        self.model = model
 
     async def find(
         self,
@@ -27,7 +30,7 @@ class SQLiteCollection(CollectionProtocol):
         where_clause = ""
         params = []
         if _filter:
-            conditions = [f"{key} = ?" for key in _filter.keys()]
+            conditions = [f"{key} = ?" for key in _filter]
             where_clause = f"WHERE {' AND '.join(conditions)}"
             params.extend(_filter.values())
 
@@ -41,11 +44,11 @@ class SQLiteCollection(CollectionProtocol):
 
         query = f"SELECT {', '.join(fields)} FROM {self.name} {where_clause} {order_clause}"
         rows = await self.connection._fetch(query, *params)
-        return [AttributedDict(row) for row in rows]
+        return [self.model.__deserialize_object__(row) for row in rows]
 
     async def find_one(
         self, _filter: dict, *, fields: tuple[str] = ("*",)
-    ) -> Optional[dict]:
+    ) -> dict | None:
         result = await self.find(_filter, fields=fields)
         return result[0] if result else None
 
@@ -54,10 +57,12 @@ class SQLiteCollection(CollectionProtocol):
         _object: dict,
         *,
         returning: tuple[str] = (),
-        typemap: Optional[dict] = None,
-    ) -> Optional[dict]:
+        typemap: dict | None = None,
+    ) -> dict | None:
         if not _object:
             return None
+        if self.model:
+            _object = self.model.__serialize_object__(_object)
 
         data = tm(_object, typemap)
         columns = ", ".join(data.keys())
@@ -76,18 +81,20 @@ class SQLiteCollection(CollectionProtocol):
         _object: dict,
         *,
         returning: tuple[str] = (),
-        typemap: Optional[dict] = None,
+        typemap: dict | None = None,
     ) -> list[dict]:
         if not _object:
             return []
+        if self.model:
+            _object = self.model.__serialize_object__(_object)
 
         data = tm(_object, typemap)
-        set_clause = ", ".join([f"{key} = ?" for key in data.keys()])
+        set_clause = ", ".join([f"{key} = ?" for key in data])
         params = list(data.values())
 
         where_clause = ""
         if _filter:
-            conditions = [f"{key} = ?" for key in _filter.keys()]
+            conditions = [f"{key} = ?" for key in _filter]
             where_clause = f"WHERE {' AND '.join(conditions)}"
             params.extend(_filter.values())
 
@@ -102,7 +109,7 @@ class SQLiteCollection(CollectionProtocol):
         where_clause = ""
         params = []
         if _filter:
-            conditions = [f"{key} = ?" for key in _filter.keys()]
+            conditions = [f"{key} = ?" for key in _filter]
             where_clause = f"WHERE {' AND '.join(conditions)}"
             params.extend(_filter.values())
 
@@ -111,11 +118,11 @@ class SQLiteCollection(CollectionProtocol):
 
     async def pop(
         self, _filter: dict, *, returning: tuple[str] = ("*",)
-    ) -> Optional[dict]:
+    ) -> dict | None:
         where_clause = ""
         params = []
         if _filter:
-            conditions = [f"{key} = ?" for key in _filter.keys()]
+            conditions = [f"{key} = ?" for key in _filter]
             where_clause = f"WHERE {' AND '.join(conditions)}"
             params.extend(_filter.values())
 
@@ -128,7 +135,7 @@ class SQLiteCollection(CollectionProtocol):
         where_clause = ""
         params = []
         if _filter:
-            conditions = [f"{key} = ?" for key in _filter.keys()]
+            conditions = [f"{key} = ?" for key in _filter]
             where_clause = f"WHERE {' AND '.join(conditions)}"
             params.extend(_filter.values())
 
@@ -168,7 +175,8 @@ class SQLiteConnection(ConnectionProtocol):
         TimeDeltaField: lambda field: 'INTEGER',
         BinaryField: lambda field: 'BLOB',
         UIDField: lambda field: 'INTEGER',
-        UUIDField: lambda field: 'TEXT'
+        UUIDField: lambda field: 'TEXT',
+        InetField: lambda field: 'BLOB'
     }
 
     def __init__(self, pool: SQLitePool, connection: aiosqlite.Connection, autocommit: bool = True):
@@ -176,10 +184,13 @@ class SQLiteConnection(ConnectionProtocol):
         self._connection = connection
         self._autocommit = autocommit
         self._in_transaction = False
+        self._models = set()
         self.collection = self.__getattr__
 
     def __getattr__(self, key) -> CollectionProtocol:
-        return SQLiteCollection(self, key)
+        return SQLiteCollection(
+            self, key, model = next(iter(model for model in self._models if model.__collection_name__() == key))
+        )
 
     async def rollback(self) -> None:
         await self._connection.rollback()
@@ -196,9 +207,9 @@ class SQLiteConnection(ConnectionProtocol):
         return [row[0] for row in rows]
 
     async def create(self, model: Model, *, exists_ok=False) -> None:
-        model._update_meta(model)
+        model._update_meta()
         fields = []
-        for field_name in model.__dict__.keys():
+        for field_name in model.__dict__:
             field = getattr(model, field_name)
             if field_name.startswith('_') or not isinstance(field, Field):
                 continue
@@ -210,7 +221,8 @@ class SQLiteConnection(ConnectionProtocol):
                     {'UNIQUE' if hasattr(field, 'unique') and field.unique else ''}
                     {'NOT NULL' if (hasattr(field, 'not_null') and field.not_null) or field_name not in model._meta_primary_keys else ''}
                     {f'REFERENCES {field.reference.collection_name}({field.reference.field_name})' 
-                     if hasattr(field, 'reference') and field.reference else ''}
+                    if hasattr(field, 'reference') and field.reference else ''}
+                    {f'DEFAULT {field.default_expr}' if hasattr(field, 'default_expr') else ''}
                 '''.strip()
             )
         await self._fetch(f'''
@@ -219,6 +231,7 @@ class SQLiteConnection(ConnectionProtocol):
                 {f',PRIMARY KEY ({','.join(model._meta_primary_keys)})' if len(model._meta_primary_keys) > 1 else ''}
             );
         '''.strip())
+        self._models.add(model)
     
     async def create_index(
         self,
@@ -316,9 +329,9 @@ class SQLitePool(PoolProtocol):
 
 
 def SQLite(
-    dsn: Optional[str] = None,
+    dsn: str | None = None,
     *,
-    database: Optional[str] = None,
+    database: str | None = None,
     autocommit: bool = True,
     **kwargs,
 ) -> SQLitePool:
@@ -331,5 +344,5 @@ def SQLite(
     :return: SQLitePool instance
     """
     if dsn:
-        return SQLitePool(dsn.split(':')[1], autocommit=autocommit, **kwargs)
+        return SQLitePool(dsn.split(':')[1].removeprefix('//'), autocommit=autocommit, **kwargs)
     return SQLitePool(database, autocommit=autocommit, **kwargs)
