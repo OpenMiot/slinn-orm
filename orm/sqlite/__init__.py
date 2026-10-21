@@ -1,8 +1,5 @@
-from __future__ import annotations
-from functools import partial
-from typing import Any, Coroutine, Optional, Final
+from typing import Any, Coroutine, Final, Iterable, Sequence
 from .. import CollectionProtocol, ConnectionProtocol, PoolProtocol
-from ..attributed_dict import AttributedDict
 from ..typemap import typemap as tm
 from ..order import OrderType
 from ..models import (
@@ -74,6 +71,22 @@ class SQLiteCollection(CollectionProtocol):
         query = f"INSERT INTO {self.name}({columns}) VALUES({placeholders}) {returning_clause}"
         rows = await self.connection._fetch(query, *data.values())
         return rows[0] if rows else None
+
+    async def insert_many(
+        self,
+        _objects: list[dict]
+    ) -> None:
+        if not _objects:
+            return 0
+        if self.model:
+            for i, _object in enumerate(_objects):
+                _objects[i] = self.model.__serialize_object__(_object)
+
+        columns = ", ".join(_objects[0])
+        placeholders = ", ".join(["?"] * len(_objects[0]))
+
+        query = f"INSERT INTO {self.name}({columns}) VALUES({placeholders})"
+        await self.connection._executemany(query, [list(_object.values()) for _object in _objects])
 
     async def update(
         self,
@@ -263,7 +276,7 @@ class SQLiteConnection(ConnectionProtocol):
         finally:
             await self._pool.release(self)
 
-    async def _fetch(self, query: str, *args, timeout: Optional[float] = None) -> list:
+    async def _fetch(self, query: str, *args, timeout: float | None = None) -> list:
         async with asyncio.timeout(timeout):
             query = " ".join(line.strip() for line in query.split("\n")).strip()
             async with self._connection.execute(query, args) as cursor:
@@ -271,7 +284,21 @@ class SQLiteConnection(ConnectionProtocol):
 
     async def _execute(self, query: str, *args) -> None:
         query = " ".join(line.strip() for line in query.split("\n")).strip()
-        await self._connection.execute(query, args)
+        async with self._connection.execute(query, args):
+            pass
+    
+    async def _executemany(
+        self,
+        query: str,
+        params_seq: Iterable[Sequence[Any]],
+        *,
+        timeout: float | None = None,
+    ) -> int:
+        query = " ".join(line.strip() for line in query.split("\n")).strip()
+        async with asyncio.timeout(timeout):
+            async with self._connection.cursor() as cursor:
+                await cursor.executemany(query, params_seq)
+                return cursor.rowcount
 
 
 class SQLitePool(PoolProtocol):

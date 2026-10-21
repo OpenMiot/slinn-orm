@@ -45,6 +45,11 @@ class Model(ABC):
                 continue
             result[field_name] = field.__deserialize__(obj[field_name])
         return result
+        
+    def __new__(cls, **kwargs):
+        if kwargs:
+            return cls().__serialize_object__(kwargs)
+        return object.__new__(cls)
 
 
 class Field(ABC):

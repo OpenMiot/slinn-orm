@@ -1,16 +1,15 @@
-from __future__ import annotations
 from .. import CollectionProtocol, ConnectionProtocol, PoolProtocol
-from ..attributed_dict import AttributedDict
 from ..typemap import typemap as tm
 from ..order import OrderType
 from ..models import (
     Model, Field, BoolField, IntegerField, DecimalField, FloatField, TextField, TimeField, TimeDeltaField, 
     BinaryField, UIDField, UUIDField, InetField
 )
-from typing import Coroutine, Optional, Final
+from typing import Coroutine, Optional, Final, Iterable, Sequence, Any
 from functools import partial
 from datetime import datetime, timedelta
 import asyncpg
+import asyncio
 
 
 class PostgresCollection(CollectionProtocol):
@@ -59,6 +58,23 @@ class PostgresCollection(CollectionProtocol):
             f'{'RETURNING' if returning else ''} {', '.join(returning)}',
             *tm(_object, typemap).values())
         return records[0] if records else None
+    
+    async def insert_many(
+        self,
+        _objects: list[dict]
+    ) -> int:
+        if not _objects:
+            return 0
+        if self.model:
+            for i, _object in enumerate(_objects):
+                _objects[i] = self.model.__serialize_object__(_object)
+
+        columns = ", ".join(_objects[0])
+        placeholders = ", ".join(["?"] * len(_objects[0]))
+
+        query = f"INSERT INTO {self.name}({columns}) VALUES({placeholders})"
+        return await self.connection._executemany(query, [list(_object.values()) for _object in _objects])
+
 
     async def update(
         self,
@@ -225,6 +241,17 @@ class PostgresConnection(ConnectionProtocol):
             timeout=timeout,
             record_class=record_class
         )
+    
+    async def _executemany(
+        self,
+        query: str,
+        params_seq: Iterable[Sequence[Any]],
+        *,
+        timeout: float | None = None,
+    ):
+        query = " ".join(line.strip() for line in query.split("\n")).strip()
+        async with asyncio.timeout(timeout):
+            await self._connection.executemany(query, params_seq)
 
 class PostgresPool(PoolProtocol):
     def __init__(self, pool_factory, autocommit=True):
@@ -256,28 +283,28 @@ class PostgresPool(PoolProtocol):
 
 
 def Postgres(
-        dsn: Optional[str] = None,
+        dsn: str | None = None,
         *,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        user: Optional[str] = None,
-        password: Optional[str] = None,
-        database: Optional[str] = None,
-        server_settings: Optional[dict] = None,
+        host: str | None = None,
+        port: int | None = None,
+        user: str | None = None,
+        password: str | None = None,
+        database: str | None = None,
+        server_settings: dict | None = None,
         autocommit: bool = True) -> PostgresPool:
     return PostgresPool(
         partial(
             asyncpg.create_pool,
             dsn,
-            server_settings=server_settings
+            server_settings = server_settings
         ) if dsn else partial(
             asyncpg.create_pool,
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-            database=database,
-            server_settings=server_settings
+            host = host,
+            port = port,
+            user = user,
+            password = password,
+            database = database,
+            server_settings = server_settings
         ),
-        autocommit=autocommit
+        autocommit = autocommit
     )
