@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slinn-orm"
-version = "0.0.5"
+version = "0.0.6"
 description = "ORM for Slinn"
 requires-python = ">=3.14"
 authors = [{ name = "Mark Radin", email = "openmiot@gmail.com" }]

@@ -1,10 +1,10 @@
-from orm.sqlite import SQLite
+from orm import get_pool
 from orm.models import Model, InetField
 from ipaddress import IPv4Address
 import asyncio
 
 
-pool = SQLite('sqlite://./db.sqlite3')
+pool = get_pool('sqlite://./db.sqlite3')
 
 class Ips(Model):
     @staticmethod

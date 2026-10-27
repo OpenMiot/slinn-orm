@@ -48,3 +48,13 @@ class PoolProtocol(Protocol):
 
 def get_driver_name(dsn: str) -> str:
     return DSN_PATTERN.findall(dsn)[0][0].lower()
+
+
+def get_pool(dsn: str) -> PoolProtocol:
+    match get_driver_name(dsn):
+        case 'sqlite' | 'sqlite3':
+            from orm.sqlite import SQLite
+            return SQLite(dsn)
+        case 'postgres' | 'pg':
+            from orm.postgres import Postgres
+            return Postgres(dsn)

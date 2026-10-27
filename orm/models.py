@@ -3,6 +3,7 @@ from typing import Literal, Optional
 from datetime import timedelta, datetime
 from typing import NamedTuple, Any
 from ipaddress import IPv4Address, IPv6Address, ip_address
+import enum
 
 
 class Model(ABC):
@@ -94,6 +95,11 @@ class BoolField(Field): ...
 class IntegerField(Field):
     def __init__(self, *, size: Literal[2, 4, 8] = 4):
         self.size = size
+    
+    def __serialize__(self, value: Any) -> int:
+        if isinstance(value, enum.Enum):
+            return value.value
+        return int(value)
 
 
 class DecimalField(Field): ...
@@ -104,7 +110,11 @@ class FloatField(Field):
         self.double = double
 
 
-class TextField(Field): ...
+class TextField(Field):
+    def __serialize__(self, value: Any) -> str:
+        if isinstance(value, enum.Enum):
+            return value.name
+        return str(value)
 
 
 class TimeField(Field):
